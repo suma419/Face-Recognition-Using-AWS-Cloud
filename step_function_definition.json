@@ -1,0 +1,16 @@
+{
+  "Comment": "Step Function for face recognition",
+  "StartAt": "ProcessUpload",
+  "States": {
+    "ProcessUpload": {
+      "Type": "Task",
+      "Resource": "arn:aws:lambda:REGION:ACCOUNT_ID:function:lambda1_process_upload",
+      "Next": "RunRecognition"
+    },
+    "RunRecognition": {
+      "Type": "Task",
+      "Resource": "arn:aws:lambda:REGION:ACCOUNT_ID:function:lambda2_run_rekognition",
+      "End": true
+    }
+  }
+}
