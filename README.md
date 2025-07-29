@@ -1,208 +1,152 @@
 # Face Recognition AWS
 
-Built a real-time face recognition pipeline using Amazon S3, Lambda, and Rekognition to detect and identify faces from uploaded images. Recognition metadata is stored in DynamoDB for real-time querying and enriched recognition data is saved in S3. Auto Scaling Groups (ASG) with EC2 instances were used to handle high-throughput, low-latency recognition workloads, achieving a 0.5-second refresh rate and 40% improvement in response time. Monitoring is enabled through CloudWatch Logs and future analytics are supported via processed S3 output.
+Built a real-time face recognition pipeline using Amazon S3, Step Functions, Lambda, and Rekognition to detect and identify faces from uploaded images. Recognition metadata is stored in DynamoDB for real-time querying and enriched recognition data is saved in S3. Auto Scaling Groups (ASG) with EC2 instances are used for optional high-throughput processing, achieving a 0.5-second refresh rate and reducing recognition response time by 40%. Monitoring is enabled via CloudWatch Logs and Athena queries.
 
 ---
 
 ## Step 1: Image Ingestion using Amazon S3
 
 **Purpose:**  
-To upload user or surveillance images and initiate the face recognition process automatically.
+To upload user or surveillance images and automatically trigger the face recognition pipeline.
 
 **How it works:**  
-- A user uploads an image to a designated S3 bucket (e.g., via mobile app, kiosk, surveillance system, or API).  
+- A user uploads an image to a designated S3 bucket (e.g., via mobile app, kiosk, or API).  
 - The image is placed under the `input/` prefix (e.g., `s3://face-input-bucket/input/image1.jpg`).  
-- The S3 bucket is configured to trigger a Lambda function on each new image upload.
+- An S3 EventBridge rule detects this and triggers a **Step Functions state machine**.
 
 **Why use S3?**  
 - Durable, scalable storage for large image files.  
-- Native event triggering for Lambda functions.  
-- Easy integration with analytics tools like Athena and Glue.
+- Native integration with EventBridge for event-driven architecture.  
+- Easy integration with analytics tools like Athena, Glue.
 
 **Output:**  
-- A new image gets uploaded to S3.  
-- Automatically triggers the recognition Lambda function.
+- A new image triggers a Step Function.  
+- The Step Function begins sequential Lambda-based processing.
 
 ---
 
-## Step 2: Lambda Function — Face Detection and Recognition
+## Step 2: Step Function Orchestration (2 Lambda Functions)
 
-**Triggered by:**  
-S3 `ObjectCreated` event on new image uploads in the `input/` folder.
-
-**Step-by-Step Breakdown of What This Lambda Does:**  
-
-1. **Read Image from S3**  
-   - Extracts bucket name and object key from the S3 event.  
-   - Loads the image content using the boto3 S3 client.  
-
-2. **Detect Faces using Amazon Rekognition**  
-   - Calls `rekognition.detect_faces()` or `rekognition.search_faces_by_image()`.  
-   - Receives response with:  
-     - Number of faces detected  
-     - Bounding boxes and facial landmarks  
-     - Confidence score  
-     - Emotions (if enabled)  
-     - Matched FaceId and similarity % (if using a face collection)  
-
-3. **Store Recognition Result in DynamoDB (Table: `FaceRecognitionResults`)**  
-   - For each face or match found, creates a new record with fields:  
-     - `image_id`: The image filename  
-     - `timestamp`: Processing time  
-     - `face_id` (if matched from collection)  
-     - `confidence`: Match or detection confidence  
-     - `bounding_box`: Face location in the image  
-     - `emotions` (optional): Top 1 or top 3 emotions  
-
-   **Why use DynamoDB?**  
-   - Real-time query support  
-   - Scalable and low-latency  
-   - Filter by user/face, time, or status  
-
-4. **Store Enriched Metadata in S3 `/processed/` Folder**  
-   - A `.json` file is created per image under:  
-     `s3://face-input-bucket/processed/image1.json`  
-   - Contains:  
-     - File metadata (name, time, etc.)  
-     - Detected faces and confidence  
-     - Emotions and landmarks  
-     - Face IDs (if applicable)  
-
-**Output of this Lambda:**  
-- ✅ Recognition metadata stored in DynamoDB  
-- ✅ Enriched `.json` stored in `/processed/`  
-- ✅ Logs available in CloudWatch for monitoring and debugging
+The Step Function runs two Lambda functions in sequence:
 
 ---
 
-## Step 3: Scalable Inference with EC2 + Auto Scaling Group (ASG)
+### ✅ Lambda 1: Face Detection using Amazon Rekognition
 
 **Purpose:**  
-To handle high-throughput or latency-sensitive face recognition workloads using a managed EC2 fleet with auto-scaling capabilities.
+To detect faces and facial attributes in the uploaded image.
 
-**Why EC2 + Auto Scaling Group?**  
-- Lambda is ideal for lightweight, quick processing, but high-load or low-latency operations (e.g., multi-face recognition, heavy OpenCV models) require compute power and control.  
-- Auto Scaling ensures availability and performance as traffic fluctuates.
+**What it does:**  
+- Reads the uploaded image from S3 (bucket + key passed via Step Function input).  
+- Calls `rekognition.detect_faces()` or `rekognition.search_faces_by_image()`.  
+- Parses the response for:  
+  - Number of faces  
+  - Bounding boxes, confidence, emotions  
+  - Matched FaceId and similarity %
 
-**How it works:**  
-- Step Functions or Lambda forwards the image or metadata to an EC2-backed REST API (e.g., Flask or FastAPI).
-- This backend runs on a fleet of EC2 instances managed by an Auto Scaling Group.
-- Scaling policies (e.g., CPU > 60%, request count) dynamically adjust the number of instances.
-
-**Technical Stack:**  
-- EC2 AMI: Amazon Linux 2 with pre-installed OpenCV, Boto3, Flask  
-- Auto Scaling Group:  
-  - Minimum: 2 instances  
-  - Maximum: 20+ instances  
-  - Target tracking: CPU utilization or queue depth  
-- Optional: Load Balancer (ALB) to distribute requests
-
-**Performance Optimizations:**  
-- Achieved a **0.5-second refresh rate** in recognition response across the dashboard.  
-- Reduced processing latency by **40%** during peak loads.  
-- Enabled **parallel processing** across EC2 nodes for batch images.
-
-**Output:**  
-- Final enriched results updated in DynamoDB and/or pushed to a frontend (e.g., Streamlit, API)
-- Logs and metrics available in CloudWatch.
+**Output to Step Function:**  
+- JSON object containing face metadata, image info, and timestamp.
 
 ---
 
-## Step 4 (Optional): Face Enrollment for Rekognition Face Collection
+### ✅ Lambda 2: Store Results in DynamoDB and Enriched S3
 
 **Purpose:**  
-To enroll known individuals into an Amazon Rekognition face collection for future matching.
+To persist the recognition results for future queries and analytics.
+
+**What it does:**  
+- Receives face metadata from Lambda 1.  
+- Writes each face result to `FaceRecognitionResults` DynamoDB table.  
+- Stores enriched results as `.json` in the `/processed/` folder of S3.
+
+**Stored Metadata Includes:**  
+- `image_id`, `timestamp`, `face_id`, `bounding_box`, `confidence`, `emotions`
+
+**Why use DynamoDB + S3?**  
+- DynamoDB for real-time querying  
+- S3 `/processed/` for long-term storage and Athena querying
+
+---
+
+## Step 3: Scalable Inference with EC2 + Auto Scaling Group (Optional)
+
+**Purpose:**  
+To support advanced, high-throughput face recognition use cases that Lambda and Rekognition alone cannot handle.
 
 **How it works:**  
-- Upload a labeled image (e.g., `john_doe.jpg`) to an enrollment S3 path or via API.  
-- Lambda function uses `rekognition.index_faces()` to register face.  
-- Metadata such as `ExternalImageId` (e.g., "John Doe") is associated.  
-- Faces are added to a collection like `my-face-collection`.
+- Images or metadata are optionally forwarded to an EC2-based microservice API (Flask/FastAPI).  
+- This compute backend is managed by an **Auto Scaling Group**:
+  - Launch Template with Amazon Linux 2 + OpenCV/TensorFlow  
+  - Scaling policies: CPU > 60%, queue length, or invocation rate  
+  - Supports up to 20+ EC2 instances during peak usage
 
-**Why enroll faces?**  
-- Enables identification (not just detection) of known individuals.  
-- Useful for employee attendance, VIP detection, etc.
+**Performance Results:**  
+- Achieved **0.5-second refresh rate** in dashboard visualizations  
+- Reduced latency by **40%** under high load  
+- Enhanced control for advanced image analysis (frame stitching, etc.)
+
+---
+
+## Step 4: Face Enrollment (Optional)
+
+**Purpose:**  
+To index known faces into a Rekognition collection for future identity matching.
+
+**How it works:**  
+- Upload labeled image to a separate S3 `enroll/` path or via UI/API  
+- A Lambda function triggered or manually invoked runs `rekognition.index_faces()`  
+- Associates `ExternalImageId` (e.g., “John Doe”) for face identity  
+- Face gets added to `my-face-collection`
 
 **Output:**  
-- New face indexed in Rekognition with a FaceId.  
-- Logs stored in CloudWatch.  
-- Indexed faces searchable by similarity.
+- Rekognition FaceId stored in collection  
+- Searchable by Rekognition in future uploads
 
 ---
 
 ## Step 5: Visualization and Monitoring
 
 **Purpose:**  
-To view logs, recognition outcomes, or monitor face detection trends.
+To monitor image processing and visualize recognition data.
 
-**Options:**  
+### Options:
+
 - **CloudWatch Logs**  
-  - Lambda and EC2 logs  
-  - Rekognition API responses  
-  - Errors or failures  
-  - Auto Scaling events and metrics
+  - Step Function state transitions  
+  - Lambda execution logs  
+  - Rekognition responses and failures  
+  - Auto Scaling EC2 lifecycle events
 
 - **Athena + S3 (Optional)**  
-  - Query processed S3 JSON files  
-  - Build dashboards on top of them  
+  - Query enriched `/processed/` JSON files  
+  - Create ad hoc reports or dashboards
 
-- **Streamlit/Dash App (Optional)**  
+- **Streamlit or Dash (Optional)**  
   - Load data from DynamoDB or API  
-  - Display faces detected, emotions, timestamps, etc.  
-  - Real-time updates every **0.5 seconds** using polling/websockets  
+  - Display real-time recognition results  
+  - Supports polling or WebSocket refresh every **0.5 seconds**
 
 ---
 
 ## Summary Table
 
-| Step | Service/Component          | Action / Trigger                              | Output / Next Step                              |
-|-------|---------------------------|-----------------------------------------------|--------------------------------------------------|
-| 1     | Amazon S3                 | Image uploaded to `input/`                    | Triggers Lambda                                 |
-| 2     | Lambda (S3 Trigger)       | Detects face(s) using Rekognition             | Stores results in DynamoDB and S3               |
-| 3     | EC2 + Auto Scaling Group  | Scales real-time inference backend            | Processes high-throughput workloads             |
-| 4     | Rekognition Face Indexing | Enroll known faces (optional)                 | Stored in Rekognition collection                |
-| 5     | CloudWatch / Athena       | View logs, run queries                        | Debugging, analytics, dashboards                |
+| Step | Component                  | Trigger / Action                                | Output                                  |
+|------|----------------------------|--------------------------------------------------|-----------------------------------------|
+| 1    | S3 + EventBridge           | Upload image to `input/`                         | Triggers Step Function                  |
+| 2.1  | Lambda 1 (Detect Face)     | Rekognition face detection                       | Face data passed to Step Function       |
+| 2.2  | Lambda 2 (Store Results)   | Write to DynamoDB + save to S3 `/processed/`     | Metadata saved                          |
+| 3    | EC2 + Auto Scaling Group   | (Optional) API-based batch or advanced processing| Low-latency, horizontally scaled backend|
+| 4    | Rekognition Face Indexing  | Enroll known faces                               | Added to Rekognition collection         |
+| 5    | CloudWatch / Athena / UI   | Monitor and visualize                            | Logs, dashboards, real-time updates     |
 
 ---
 
 ## Additional Notes
 
-- Ensure proper IAM roles and policies are assigned to Lambda and EC2 (S3, DynamoDB, Rekognition access).  
-- Configure S3 event notifications or EventBridge to trigger Step Functions or Lambda.  
-- Use CloudWatch Alarms to monitor EC2 instance count, CPU, and recognition errors.  
-- Incorporate ALB/NLB for load balancing across EC2 workers if needed.  
-- Design dashboard frontends (Streamlit/Dash) to refresh every 0.5 seconds to reflect near-real-time updates.
-
----
-
-**Happy face recognizing!** 😃
-
----
-
-## Summary Table
-
-| Step | Service/Component          | Action / Trigger                              | Output / Next Step                              |
-|-------|--------------------------|----------------------------------------------|------------------------------------------------|
-| 1     | Amazon S3                 | Image uploaded to `input/`                    | Triggers Lambda                                |
-| 2     | Lambda (S3 Trigger)       | Detects face(s) using Rekognition             | Stores results in DynamoDB and S3               |
-| 3     | Rekognition Face Indexing | Enroll known faces (optional)                  | Stored in Rekognition collection                 |
-| 4     | CloudWatch / Athena       | View logs, run queries                         | Debugging, analytics, dashboards                 |
-
----
-
-## Additional Notes
-
-- Ensure proper IAM roles and policies are assigned to Lambda for access to S3, DynamoDB, and Rekognition.  
-- Configure S3 event notifications to trigger Lambda on specific prefixes like `input/`.  
-- Adjust DynamoDB table schema based on your application's querying needs.  
-- Monitor CloudWatch logs regularly for failures or throttling.  
-- Use Step Functions if chaining multiple Lambdas or for enhanced workflow orchestration.
-
----
-
-Feel free to enhance this README with deployment instructions, architecture diagrams, or sample API requests based on your repo/project needs.
-
----
-
-**Happy face recognizing!** 😃
+- Step Function Input Format:
+```json
+{
+  "bucket": "face-input-bucket",
+  "key": "input/image1.jpg"
+}
 
